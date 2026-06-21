@@ -83,6 +83,9 @@ def resolve_matchup(video_path):
     return team_names[:2], source
 
 def resolve_requested_team(team_query, team_names):
+    if not team_query or not team_names:
+        return None
+
     query_matches = extract_team_names_from_text(team_query)
 
     for query_match in query_matches:
@@ -93,9 +96,6 @@ def resolve_requested_team(team_query, team_names):
     for team_name in team_names:
         if normalized_query and normalized_query in team_name.lower():
             return team_name
-
-    if team_names:
-        return team_names[0]
 
     return None
 
