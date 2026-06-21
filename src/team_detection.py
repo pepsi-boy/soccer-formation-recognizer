@@ -155,7 +155,7 @@ def selected_display_to_internal(selected_team, team_names, team_cluster_map=Non
     if selected_team in team_cluster_map:
         return team_cluster_map[selected_team]
 
-    return "Team 1"
+    return None
 
 def update_team_status(video_input):
     video_path = get_video_path(video_input)
