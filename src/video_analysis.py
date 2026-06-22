@@ -300,11 +300,13 @@ def analyze_video(
 
     team_names, matchup_source = resolve_matchup(video_path)
     requested_team_name = resolve_requested_team(team_query, team_names)
-    return None, None, [], (
-    f"Input team '{team_query}' could not be recognized or matched "
-    f"to the detected teams in this video. "
-    f"Detected teams: {', '.join(team_names) if team_names else 'none'}."
-)
+
+    if requested_team_name is None:
+        return None, None, [], (
+            f"Input team '{team_query}' could not be recognized or matched "
+            f"to the detected teams in this video. "
+            f"Detected teams: {', '.join(team_names) if team_names else 'none'}."
+        )
     first_frame = read_first_frame(video_path)
     scoreboard_kit_colors = []
     if first_frame is not None:

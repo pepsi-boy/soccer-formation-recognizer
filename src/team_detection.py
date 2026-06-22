@@ -152,8 +152,17 @@ def selected_display_to_internal(selected_team, team_names, team_cluster_map=Non
         return selected_team
 
     team_cluster_map = team_cluster_map or {}
+
     if selected_team in team_cluster_map:
         return team_cluster_map[selected_team]
+
+    # Fallback when cluster mapping hasn't been established yet
+    if team_names:
+        if selected_team == team_names[0]:
+            return "Team 1"
+
+        if len(team_names) > 1 and selected_team == team_names[1]:
+            return "Team 2"
 
     return None
 
