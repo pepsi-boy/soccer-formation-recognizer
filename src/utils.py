@@ -1,35 +1,191 @@
+import os
+import re
+
 import cv2
 import numpy as np
-import re
-import os
 
-from .config import TEAM_ABBREVIATIONS, TEAM_NAME_ALIASES
+from .config import TEAM_ABBREVIATIONS, TEAM_NAME_ALIASES, TEAM_TYPE
 
-def get_video_path(video_input):
-    if isinstance(video_input, dict):
-        return video_input.get("path")
-    return video_input
 
-def normalize_text(value):
-    if value is None:
+# ============================================================
+# Color helpers
+# ============================================================
+
+def bgr_to_lab_color(bgr):
+    """Convert a single BGR color (3,) to LAB via OpenCV."""
+    pixel = np.uint8([[bgr]])
+    lab = cv2.cvtColor(pixel, cv2.COLOR_BGR2LAB)
+    return lab[0, 0].astype(np.float32)
+
+
+def describe_lab_color(lab):
+    """Return a rough human-readable color name from a LAB value."""
+    l, a, b = float(lab[0]), float(lab[1]), float(lab[2])
+    if l < 35:
+        return "Black/Dark"
+    if l > 200:
+        return "White/Light"
+    if a > 150:
+        return "Red"
+    if a < 110:
+        return "Green"
+    if b > 150:
+        return "Yellow"
+    if b < 110:
+        return "Blue"
+    return "Mid-tone"
+
+
+# ============================================================
+# Text normalization
+# ============================================================
+
+def normalize_text(text):
+    """Basic text normalization for OCR output."""
+    text = text.strip()
+    text = re.sub(r"[^\w\s\-&.']", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+# ============================================================
+# Abbreviation disambiguation
+# ============================================================
+
+def _pick_from_candidates(candidates, preferred_type=None):
+    """Pick a single team from a list of candidates sharing an abbreviation."""
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    if preferred_type:
+        typed = [c for c in candidates if TEAM_TYPE.get(c) == preferred_type]
+        if typed:
+            return typed[0]
+    # Default: first registered wins (club, since clubs are registered first)
+    return candidates[0]
+
+
+def _infer_context(left_candidates, right_candidates):
+    """
+    If either side has an unambiguous type, use that as context for both.
+    If both sides have international teams available, prefer international.
+    """
+    left_types = {TEAM_TYPE.get(c) for c in left_candidates} if left_candidates else set()
+    right_types = {TEAM_TYPE.get(c) for c in right_candidates} if right_candidates else set()
+
+    # If one side is unambiguously international, treat both as international
+    if left_candidates and len(left_candidates) == 1 and "international" in left_types:
+        return "international"
+    if right_candidates and len(right_candidates) == 1 and "international" in right_types:
+        return "international"
+
+    # If one side is unambiguously club, treat both as club
+    if left_candidates and len(left_candidates) == 1 and "club" in left_types:
+        return "club"
+    if right_candidates and len(right_candidates) == 1 and "club" in right_types:
+        return "club"
+
+    # If both sides have international candidates, prefer international
+    if "international" in left_types and "international" in right_types:
+        return "international"
+
+    # If both sides have club candidates, prefer club
+    if "club" in left_types and "club" in right_types:
+        return "club"
+
+    return None
+
+
+def abbreviations_to_teams(left_abbr, right_abbr):
+    """
+    Resolve two abbreviations to canonical team names,
+    disambiguating shared codes using match context.
+    """
+    left_candidates = TEAM_ABBREVIATIONS.get(left_abbr, [])
+    right_candidates = TEAM_ABBREVIATIONS.get(right_abbr, [])
+
+    context = _infer_context(left_candidates, right_candidates)
+
+    left_team = _pick_from_candidates(left_candidates, preferred_type=context)
+    right_team = _pick_from_candidates(right_candidates, preferred_type=context)
+
+    return left_team, right_team
+
+
+# ============================================================
+# OCR helpers
+# ============================================================
+
+def ocr_scorebug_strip(frame):
+    """
+    OCR a wide horizontal strip across the top of the frame where the
+    scorebug lives on any broadcaster layout.
+    Returns the raw OCR text.
+    """
+    try:
+        import pytesseract
+    except ImportError:
         return ""
-    return str(value).replace("_", " ").replace("-", " ").strip()
+
+    height, width = frame.shape[:2]
+    strip_height = int(height * 0.12)
+    strip = frame[0:strip_height, 0:width]
+    gray = cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY)
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    try:
+        text = pytesseract.image_to_string(thresh, config="--psm 7")
+    except Exception:
+        text = ""
+    return text
+
+
+def extract_scoreboard_abbreviations(text):
+    """
+    Extract two 2-4 letter abbreviations from OCR text (left team, right team).
+    """
+    normalized = normalize_text(text).upper()
+    found = re.findall(r"\b[A-Z]{2,4}\b", normalized)
+    # Filter to only those that exist in our abbreviation registry
+    valid = [f for f in found if f in TEAM_ABBREVIATIONS]
+    left = valid[0] if len(valid) > 0 else ""
+    right = valid[1] if len(valid) > 1 else ""
+    return left, right
+
+
+def extract_scoreboard_text(frame):
+    """OCR the scorebug and return raw text."""
+    return ocr_scorebug_strip(frame)
+
+
+# ============================================================
+# Team name extraction from text
+# ============================================================
 
 def extract_team_names_from_text(text):
+    """
+    Extract up to 2 team names from arbitrary text using abbreviations and aliases.
+    Returns list of canonical team names.
+    """
+    if not text:
+        return []
+
     normalized = normalize_text(text)
     found_names = []
 
+    # Check abbreviations (now list-based, take first candidate as fallback)
     for token in re.findall(r"\b[A-Z]{2,4}\b", normalized.upper()):
-        team_name = TEAM_ABBREVIATIONS.get(token)
-        if team_name and team_name not in found_names:
-            found_names.append(team_name)
+        candidates = TEAM_ABBREVIATIONS.get(token, [])
+        if candidates:
+            team_name = candidates[0]
+            if team_name not in found_names:
+                found_names.append(team_name)
 
+    # Check aliases (longest match first)
     lowered = normalized.lower()
     alias_matches = []
     for alias, team_name in sorted(
-        TEAM_NAME_ALIASES.items(),
-        key=lambda item: len(item[0]),
-        reverse=True,
+        TEAM_NAME_ALIASES.items(), key=lambda item: len(item[0]), reverse=True,
     ):
         match_index = lowered.find(alias)
         if match_index >= 0:
@@ -41,195 +197,174 @@ def extract_team_names_from_text(text):
 
     return found_names[:2]
 
-def ocr_scorebug_strip(frame):
-    """
-    OCR a wide horizontal strip across the top of the frame where the
-    scorebug lives on any broadcaster layout. Returns the raw OCR text.
-    Works for NBC Sports, Sky Sports, BT Sport, ESPN, beIN, etc. because
-    we read the entire strip rather than guessing which x-position each
-    team name sits at.
-    """
-    try:
-        import pytesseract
-    except ImportError:
-        return ""
-
-    height, width = frame.shape[:2]
-
-    # Wide strip: full width, top 22% of frame — captures any scorebug position
-    strip = frame[
-        int(height * 0.04): int(height * 0.22),
-        int(width * 0.00): int(width * 1.00),
-    ]
-
-    if strip.size == 0:
-        return ""
-
-    gray = cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY)
-    # Upscale 3x so small text becomes legible
-    gray = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
-
-    best_text = ""
-    for variant in [gray, cv2.bitwise_not(gray)]:
-        _, thresh = cv2.threshold(variant, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        try:
-            # psm 11 = sparse text, finds words anywhere in the image
-            text = pytesseract.image_to_string(
-                thresh,
-                config="--oem 3 --psm 11 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ&.- "
-            ).strip()
-        except Exception:
-            text = ""
-        if sum(ch.isalpha() for ch in text) > sum(ch.isalpha() for ch in best_text):
-            best_text = text
-
-    return best_text
-
-def extract_scorebug_abbreviations(frame):
-    """
-    Read the full scorebug strip and return the first two team abbreviations
-    found in it as (left_abbr, right_abbr). Order is best-effort based on
-    which known abbreviation appears first in the OCR text.
-    """
-    text = ocr_scorebug_strip(frame)
-    print("[OCR scorebug strip]", repr(text))
-
-    tokens = re.findall(r"\b[A-Z]{2,4}\b", text.upper())
-    found = []
-    for token in tokens:
-        if token in TEAM_ABBREVIATIONS and token not in found:
-            found.append(token)
-        if len(found) >= 2:
-            break
-
-    left  = found[0] if len(found) > 0 else ""
-    right = found[1] if len(found) > 1 else ""
-    return left, right
-
-def abbreviations_to_teams(left_abbr, right_abbr):
-    left_team  = TEAM_ABBREVIATIONS.get(left_abbr)
-    right_team = TEAM_ABBREVIATIONS.get(right_abbr)
-    return left_team, right_team
 
 def extract_team_names_from_scoreboard_text(text):
-    normalized = normalize_text(text).upper()
-    found_names = []
+    """
+    Extract team names from scoreboard OCR text specifically.
+    Uses context-aware disambiguation for shared abbreviations.
+    """
+    if not text:
+        return []
 
-    for token in re.findall(r"\b[A-Z]{2,4}\b", normalized):
-        team_name = TEAM_ABBREVIATIONS.get(token)
-        if team_name and team_name not in found_names:
+    normalized = normalize_text(text).upper()
+    found_abbrs = re.findall(r"\b[A-Z]{2,4}\b", normalized)
+    valid_abbrs = [f for f in found_abbrs if f in TEAM_ABBREVIATIONS]
+
+    # If we found two abbreviations, use context-aware resolution
+    if len(valid_abbrs) >= 2:
+        left_team, right_team = abbreviations_to_teams(valid_abbrs[0], valid_abbrs[1])
+        results = []
+        if left_team:
+            results.append(left_team)
+        if right_team and right_team != left_team:
+            results.append(right_team)
+        if len(results) >= 2:
+            return results[:2]
+
+    # Fall back to alias matching
+    found_names = []
+    lowered = normalize_text(text).lower()
+    alias_matches = []
+    for alias, team_name in sorted(
+        TEAM_NAME_ALIASES.items(), key=lambda item: len(item[0]), reverse=True,
+    ):
+        match_index = lowered.find(alias)
+        if match_index >= 0:
+            alias_matches.append((match_index, team_name))
+
+    for _, team_name in sorted(alias_matches):
+        if team_name not in found_names:
             found_names.append(team_name)
 
     return found_names[:2]
 
-def extract_scoreboard_text(frame):
-    return ocr_scorebug_strip(frame)
+
+# ============================================================
+# Video path / frame helpers
+# ============================================================
+
+def get_video_path(video_input):
+    """Get the file path from Gradio video input (handles str or dict)."""
+    if isinstance(video_input, str):
+        return video_input
+    if isinstance(video_input, dict):
+        return video_input.get("video", video_input.get("name", ""))
+    return str(video_input)
+
 
 def read_first_frame(video_path):
-    capture = cv2.VideoCapture(video_path)
-    success, frame = capture.read()
-    capture.release()
-
-    if not success:
+    """Read and return the first frame of a video file."""
+    cap = cv2.VideoCapture(video_path)
+    ret, frame = cap.read()
+    cap.release()
+    if not ret:
         return None
-
     return frame
 
+
+# ============================================================
+# Matchup resolution
+# ============================================================
+
 def resolve_matchup(video_path):
-    basename = os.path.basename(video_path) if video_path else ""
-    searchable_text = normalize_text(basename)
-    team_names = extract_team_names_from_text(searchable_text)
-    source = "filename"
+    """
+    Attempt to detect the two teams in the match from scoreboard OCR.
+    Falls back to filename parsing.
+    Returns (list_of_team_names, source_string).
+    """
+    team_names = []
+    source = "unknown"
 
-    if len(team_names) < 2 and video_path:
-        capture = cv2.VideoCapture(video_path)
-        frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return _fallback_from_filename(video_path)
 
-        # Sample early frames — scorebug is almost always visible from the start
-        sample_frames = [0, frame_count // 10, frame_count // 5, frame_count // 3]
-        sample_frames = sorted(set(max(0, idx) for idx in sample_frames))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    # Sample a few frames from the beginning
+    sample_indices = [int(total_frames * f) for f in [0.0, 0.02, 0.05, 0.1, 0.15]]
 
-        for frame_index in sample_frames:
-            capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-            success, frame = capture.read()
-            if not success:
-                continue
+    for idx in sample_indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if not ret:
+            continue
 
-            left_abbr, right_abbr = extract_scorebug_abbreviations(frame)
-            print("LEFT ABBR:", repr(left_abbr))
-            print("RIGHT ABBR:", repr(right_abbr))
+        text = ocr_scorebug_strip(frame)
+        if not text.strip():
+            continue
 
-            left_team, right_team = abbreviations_to_teams(left_abbr, right_abbr)
+        left_abbr, right_abbr = extract_scoreboard_abbreviations(text)
+        if not left_abbr or not right_abbr:
+            continue
 
-            for team_name in [left_team, right_team]:
-                if team_name and team_name not in team_names:
-                    team_names.append(team_name)
+        left_team, right_team = abbreviations_to_teams(left_abbr, right_abbr)
+        for team_name in [left_team, right_team]:
+            if team_name and team_name not in team_names:
+                team_names.append(team_name)
+        if len(team_names) >= 2:
+            source = "OCR"
+            break
 
-            if len(team_names) >= 2:
-                source = "OCR"
-                break
+    cap.release()
 
-        capture.release()
+    if len(team_names) < 2:
+        fallback_names, fallback_source = _fallback_from_filename(video_path)
+        for name in fallback_names:
+            if name not in team_names:
+                team_names.append(name)
+        if len(team_names) >= 2 and source == "unknown":
+            source = fallback_source
 
     if len(team_names) < 2:
         source = "fallback"
 
     return team_names[:2], source
 
+
+def _fallback_from_filename(video_path):
+    """Try to extract team names from the video filename."""
+    basename = os.path.splitext(os.path.basename(video_path))[0]
+    names = extract_team_names_from_text(basename)
+    if len(names) >= 2:
+        return names[:2], "filename"
+    return names, "filename"
+
+
+# ============================================================
+# User team query resolution
+# ============================================================
+
 def resolve_requested_team(team_query, team_names):
+    """
+    Resolve user's team query against detected team names.
+    Returns the canonical name that matches, or the first detected team as fallback.
+    """
     if not team_query or not team_names:
         return None
 
+    # Try extracting team names from the query text
     query_matches = extract_team_names_from_text(team_query)
+    if query_matches:
+        for match in query_matches:
+            if match in team_names:
+                return match
 
-    for query_match in query_matches:
-        if query_match in team_names:
-            return query_match
+    # Try abbreviation lookup (list-based)
+    abbr_key = team_query.strip().upper()
+    candidates = TEAM_ABBREVIATIONS.get(abbr_key, [])
+    for candidate in candidates:
+        if candidate in team_names:
+            return candidate
 
-    normalized_query = normalize_text(team_query).lower()
+    # Try alias lookup
+    alias_match = TEAM_NAME_ALIASES.get(team_query.strip().lower())
+    if alias_match and alias_match in team_names:
+        return alias_match
 
-    for team_name in team_names:
-        if normalized_query and normalized_query in team_name.lower():
-            return team_name
+    # Fuzzy: check if query is substring of any detected name
+    for name in team_names:
+        if team_query.strip().lower() in name.lower():
+            return name
 
-    return None
-
-def describe_lab_color(lab_color):
-    lab_array = np.uint8([[lab_color]])
-    bgr = cv2.cvtColor(lab_array, cv2.COLOR_LAB2BGR)[0][0]
-    hsv = cv2.cvtColor(np.uint8([[bgr]]), cv2.COLOR_BGR2HSV)[0][0]
-    hue, saturation, value = [int(channel) for channel in hsv]
-
-    if value < 55:
-        return "dark kit"
-    if saturation < 35 and value > 190:
-        return "white/light kit"
-    if saturation < 45:
-        return "gray kit"
-    if hue < 10 or hue >= 170:
-        return "red kit"
-    if hue < 25:
-        return "orange kit"
-    if hue < 35:
-        return "yellow kit"
-    if hue < 85:
-        return "green kit"
-    if hue < 100:
-        return "cyan kit"
-    if hue < 130:
-        return "blue kit"
-    if hue < 160:
-        return "purple kit"
-    return "pink kit"
-
-def average_lab_to_bgr(lab_color):
-    lab_array = np.uint8([[np.clip(lab_color, 0, 255)]])
-    return cv2.cvtColor(lab_array, cv2.COLOR_LAB2BGR)[0][0]
-
-def bgr_to_lab_color(bgr_color):
-    bgr_array = np.uint8([[np.clip(bgr_color, 0, 255)]])
-    return cv2.cvtColor(bgr_array, cv2.COLOR_BGR2LAB)[0][0].astype(float)
-
-def describe_bgr_color(bgr_color):
-    return describe_lab_color(bgr_to_lab_color(bgr_color))
+    # Last resort: return first detected team
+    return team_names[0] if team_names else None
