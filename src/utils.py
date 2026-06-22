@@ -25,7 +25,11 @@ def extract_team_names_from_text(text):
 
     lowered = normalized.lower()
     alias_matches = []
-    for alias, team_name in TEAM_NAME_ALIASES.items():
+    for alias, team_name in sorted(
+    TEAM_NAME_ALIASES.items(),
+    key=lambda item: len(item[0]),
+    reverse=True,
+):
         match_index = lowered.find(alias)
         if match_index >= 0:
             alias_matches.append((match_index, team_name))
