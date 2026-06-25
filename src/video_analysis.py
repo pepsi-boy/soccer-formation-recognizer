@@ -17,6 +17,7 @@ from .team_detection import (
     extract_scoreboard_kit_colors,
     get_jersey_color,
     get_team_color_data,
+    override_team_cluster_by_color_hint,
     resolve_team_cluster_map,
     selected_display_to_internal,
 )
@@ -31,230 +32,152 @@ from .utils import (
 )
 from .visualization import create_pitch_map, draw_boxes, make_coordinate_table
 
+
+# ============================================================
+# YOLO model
+# ============================================================
+
 model = YOLO("yolov8n.pt")
 
+
+# ============================================================
+# Tracking helpers
+# ============================================================
+
+def get_sample_frame_indices(processed_frame_count):
+    """Return indices of frames to use as visual candidates."""
+    if processed_frame_count <= SAMPLE_FRAME_COUNT:
+        return list(range(processed_frame_count))
+    step = processed_frame_count / SAMPLE_FRAME_COUNT
+    return [int(i * step) for i in range(SAMPLE_FRAME_COUNT)]
+
+
 def extract_players_from_frame(frame):
+    """Single-frame detection (no tracking)."""
     height, width = frame.shape[:2]
-
     results = model(frame, classes=[0], conf=0.35, verbose=False)
-
     players = []
 
     for i, box in enumerate(results[0].boxes, start=1):
         x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
         confidence = float(box.conf[0])
-
         center_x = (x1 + x2) / 2
         foot_y = y2
-
         normalized_x = center_x / width
         normalized_y = foot_y / height
-
         bbox = [float(x1), float(y1), float(x2), float(y2)]
+        jersey_color = get_jersey_color(frame, bbox)
 
-        players.append(
-            {
-                "id": i,
-                "x": float(center_x),
-                "y": float(foot_y),
-                "normalized_x": float(normalized_x),
-                "normalized_y": float(normalized_y),
-                "confidence": confidence,
-                "bbox": bbox,
-                "jersey_color": get_jersey_color(frame, bbox),
-                "team": "Unknown",
-            }
-        )
+        players.append({
+            "id": i,
+            "track_id": None,
+            "frame_index": 0,
+            "x": float(center_x),
+            "y": float(foot_y),
+            "normalized_x": float(normalized_x),
+            "normalized_y": float(normalized_y),
+            "confidence": confidence,
+            "bbox": bbox,
+            "jersey_color": jersey_color,
+            "team": "Unknown",
+        })
 
     return players
 
+
 def extract_players_from_tracking_result(result, frame_index):
+    """Extract player dicts from a single YOLO tracking result."""
     frame = result.orig_img
     height, width = frame.shape[:2]
 
-    if result.boxes is None:
+    if result.boxes is None or len(result.boxes) == 0:
         return []
 
     players = []
-    track_ids = result.boxes.id
+    boxes = result.boxes
+    track_ids = boxes.id
 
-    for i, box in enumerate(result.boxes, start=1):
-        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-        confidence = float(box.conf[0])
+    for i in range(len(boxes)):
+        bbox = boxes.xyxy[i].cpu().numpy()
+        x1, y1, x2, y2 = bbox
+        confidence = float(boxes.conf[i].cpu().numpy())
 
+        track_id = None
         if track_ids is not None:
-            track_id = int(track_ids[i - 1].cpu().item())
-        else:
-            track_id = int((frame_index * 1000) + i)
+            track_id = int(track_ids[i].cpu().numpy())
 
         center_x = (x1 + x2) / 2
         foot_y = y2
-
         normalized_x = center_x / width
         normalized_y = foot_y / height
 
-        bbox = [float(x1), float(y1), float(x2), float(y2)]
+        bbox_list = [float(x1), float(y1), float(x2), float(y2)]
+        jersey_color = get_jersey_color(frame, bbox_list)
 
-        players.append(
-            {
-                "id": track_id,
-                "track_id": track_id,
-                "frame_index": frame_index,
-                "x": float(center_x),
-                "y": float(foot_y),
-                "normalized_x": float(normalized_x),
-                "normalized_y": float(normalized_y),
-                "confidence": confidence,
-                "bbox": bbox,
-                "jersey_color": get_jersey_color(frame, bbox),
-                "team": "Unknown",
-            }
-        )
+        players.append({
+            "id": track_id or i,
+            "track_id": track_id,
+            "frame_index": frame_index,
+            "x": float(center_x),
+            "y": float(foot_y),
+            "normalized_x": float(normalized_x),
+            "normalized_y": float(normalized_y),
+            "confidence": confidence,
+            "bbox": bbox_list,
+            "jersey_color": jersey_color,
+            "team": "Unknown",
+        })
 
     return players
 
-def build_unique_tracked_players(tracked_detections):
-    tracks = {}
 
+def build_unique_tracked_players(tracked_detections):
+    """Aggregate detections by track_id into unique players with averaged positions."""
+    tracks = {}
     for detection in tracked_detections:
-        track_id = detection["track_id"]
+        track_id = detection.get("track_id")
+        if track_id is None:
+            continue
         tracks.setdefault(track_id, []).append(detection)
 
     unique_players = []
-
     for track_id, detections in tracks.items():
-        best_detection = max(detections, key=lambda detection: detection["confidence"])
+        best_detection = max(detections, key=lambda d: d["confidence"])
 
-        unique_players.append(
-            {
-                "id": track_id,
-                "track_id": track_id,
-                "team": "Unknown",
-                "x": float(np.mean([detection["x"] for detection in detections])),
-                "y": float(np.mean([detection["y"] for detection in detections])),
-                "normalized_x": float(
-                    np.mean([detection["normalized_x"] for detection in detections])
-                ),
-                "normalized_y": float(
-                    np.mean([detection["normalized_y"] for detection in detections])
-                ),
-                "confidence": float(
-                    np.mean([detection["confidence"] for detection in detections])
-                ),
-                "bbox": best_detection["bbox"],
-                "jersey_color": np.mean(
-                    [detection["jersey_color"] for detection in detections], axis=0
-                ),
-                "observations": len(detections),
-            }
-        )
+        unique_players.append({
+            "id": track_id,
+            "track_id": track_id,
+            "team": "Unknown",
+            "x": float(np.mean([d["x"] for d in detections])),
+            "y": float(np.mean([d["y"] for d in detections])),
+            "normalized_x": float(np.mean([d["normalized_x"] for d in detections])),
+            "normalized_y": float(np.mean([d["normalized_y"] for d in detections])),
+            "confidence": float(np.mean([d["confidence"] for d in detections])),
+            "bbox": best_detection["bbox"],
+            "jersey_color": np.mean(
+                [d["jersey_color"] for d in detections], axis=0
+            ),
+            "observations": len(detections),
+        })
 
     return unique_players
 
+
 def propagate_track_teams(detections, unique_players):
-    team_by_track_id = {
-        player["track_id"]: player["team"]
-        for player in unique_players
-    }
-
+    """Copy team labels from unique_players back to per-frame detections."""
+    team_by_track = {p["track_id"]: p.get("team") for p in unique_players}
     for detection in detections:
-        detection["team"] = team_by_track_id.get(detection["track_id"], "Unknown")
+        track_id = detection.get("track_id")
+        if track_id and track_id in team_by_track:
+            detection["team"] = team_by_track[track_id]
 
-    return detections
-
-def get_sample_frame_indices(frame_count, sample_count=SAMPLE_FRAME_COUNT):
-    if frame_count <= 0:
-        return []
-
-    if frame_count <= sample_count:
-        return list(range(frame_count))
-
-    start_frame = int(frame_count * 0.1)
-    end_frame = max(start_frame + 1, int(frame_count * 0.9))
-    frame_indices = np.linspace(start_frame, end_frame, sample_count, dtype=int)
-
-    return sorted(set(int(frame_index) for frame_index in frame_indices))
-
-def score_frame(players, selected_team):
-    selected_players = [player for player in players if player["team"] == selected_team]
-    average_confidence = 0
-
-    if players:
-        average_confidence = float(np.mean([player["confidence"] for player in players]))
-
-    return (len(selected_players), len(players), average_confidence)
-
-def assign_teams_across_candidates(candidates):
-    all_players = []
-
-    for candidate in candidates:
-        all_players.extend(candidate["players"])
-
-    if len(all_players) < 2:
-        return candidates
-
-    jersey_colors = np.array([player["jersey_color"] for player in all_players])
-    kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
-    team_labels = kmeans.fit_predict(jersey_colors)
-
-    for player, label in zip(all_players, team_labels):
-        player["team"] = f"Team {label + 1}"
-
-    return candidates
-
-def collect_sampled_frame_candidates(cap, frame_count):
-    sample_indices = get_sample_frame_indices(frame_count)
-    candidates = []
-
-    for frame_index in sample_indices:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-        success, frame = cap.read()
-
-        if not success:
-            continue
-
-        players = extract_players_from_frame(frame)
-        candidates.append(
-            {
-                "frame": frame,
-                "frame_index": frame_index,
-                "players": players,
-            }
-        )
-
-    candidates = assign_teams_across_candidates(candidates)
-
-    return candidates, len(sample_indices)
-
-def find_best_visual_candidate(candidates, selected_team):
-    best_candidate = None
-
-    for candidate in candidates:
-        players = candidate["players"]
-        candidate["selected_players"] = [
-            player for player in players if player["team"] == selected_team
-        ]
-        candidate["score"] = score_frame(players, selected_team)
-
-        if best_candidate is None or candidate["score"] > best_candidate["score"]:
-            best_candidate = candidate
-
-    return best_candidate
-
-def get_aggregate_selected_players(candidates, selected_team):
-    selected_players = []
-
-    for candidate in candidates:
-        for player in candidate["players"]:
-            if player["team"] == selected_team:
-                selected_players.append(player)
-
-    return selected_players
 
 def analyze_video_with_tracking(video_path, frame_count, frame_stride):
+    """Run YOLO tracking across the video and return candidates + unique players."""
     frame_stride = max(1, int(frame_stride))
     processed_frame_count = max(1, int(np.ceil(frame_count / frame_stride)))
     sample_indices = set(get_sample_frame_indices(processed_frame_count))
+
     detections = []
     candidates = []
 
@@ -273,14 +196,12 @@ def analyze_video_with_tracking(video_path, frame_count, frame_stride):
         players = extract_players_from_tracking_result(result, frame_index)
         detections.extend(players)
 
-        if processed_index in sample_indices or (not sample_indices and processed_index == 0):
-            candidates.append(
-                {
-                    "frame": result.orig_img.copy(),
-                    "frame_index": frame_index,
-                    "players": players,
-                }
-            )
+        if processed_index in sample_indices:
+            candidates.append({
+                "frame": result.orig_img.copy(),
+                "frame_index": frame_index,
+                "players": players,
+            })
 
     unique_players = build_unique_tracked_players(detections)
     unique_players = assign_teams_by_color(unique_players)
@@ -288,30 +209,67 @@ def analyze_video_with_tracking(video_path, frame_count, frame_stride):
 
     return candidates, unique_players, len(sample_indices)
 
-def analyze_video(
-    video_input,
-    team_query,
-    frame_stride,
-):
-    video_path = get_video_path(video_input)
 
-    if video_path is None:
-        return None, None, [], "Please upload a video first."
+# ============================================================
+# Main analysis function
+# ============================================================
 
-    team_names, matchup_source = resolve_matchup(video_path)
-    requested_team_name = resolve_requested_team(team_query, team_names)
+def find_best_visual_candidate(candidates, selected_team):
+    """Pick the candidate frame with the most players from the selected team."""
+    best = None
+    best_score = -1
 
-    if requested_team_name is None:
-        return None, None, [], (
-            f"Input team '{team_query}' could not be recognized or matched "
-            f"to the detected teams in this video. "
-            f"Detected teams: {', '.join(team_names) if team_names else 'none'}."
+    for candidate in candidates:
+        players = candidate["players"]
+        team_players = [p for p in players if p.get("team") == selected_team]
+        candidate["selected_players"] = team_players
+
+        avg_conf = (
+            np.mean([p.get("confidence", 0) for p in team_players])
+            if team_players
+            else 0
         )
-    first_frame = read_first_frame(video_path)
-    scoreboard_kit_colors = []
-    if first_frame is not None:
-        scoreboard_kit_colors = extract_scoreboard_kit_colors(first_frame)
+        score = len(team_players) * 1000 + avg_conf
 
+        if score > best_score:
+            best_score = score
+            best = candidate
+
+    return best
+
+
+def analyze_video(video_input, team_query, frame_stride, jersey_color_hint="Auto-detect"):
+    """Main analysis pipeline. Returns 5 outputs for the Gradio UI."""
+    video_path = get_video_path(video_input)
+    if not video_path:
+        empty_msg = "*Please upload a video first.*"
+        return None, None, [], empty_msg, ""
+
+    # ------------------------------------------------------------------
+    # 1. Resolve matchup
+    # ------------------------------------------------------------------
+    team_names, matchup_source = resolve_matchup(video_path)
+
+    # ------------------------------------------------------------------
+    # 1b. Validate user's team query against detected teams
+    # ------------------------------------------------------------------
+    if team_query and team_query.strip() and len(team_names) >= 2:
+        resolved = resolve_requested_team(team_query, team_names)
+        if resolved is None:
+            return (
+                None,
+                None,
+                [],
+                f"⚠️ **'{team_query}' is not one of the detected teams.**\n\n"
+                f"Detected teams: **{team_names[0]}** and **{team_names[1]}**.\n\n"
+                f"Please enter one of those team names (or their abbreviation), "
+                f"or leave the field blank to analyze the first team.",
+                "",
+            )
+
+    # ------------------------------------------------------------------
+    # 2. Track players across the clip
+    # ------------------------------------------------------------------
     video_capture = cv2.VideoCapture(video_path)
     frame_count = int(video_capture.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = video_capture.get(cv2.CAP_PROP_FPS)
@@ -323,42 +281,156 @@ def analyze_video(
         frame_stride,
     )
 
+    if not candidates:
+        empty_msg = "**⚠️ No players detected.** Try a different clip or lower the frame stride."
+        return None, None, [], empty_msg, ""
+
+    # Propagate team labels to candidate frames
     for candidate in candidates:
         propagate_track_teams(candidate["players"], unique_players)
 
+    # ------------------------------------------------------------------
+    # 3. Detect scoreboard kit colors and resolve cluster-to-team mapping
+    # ------------------------------------------------------------------
+    first_frame_cap = cv2.VideoCapture(video_path)
+    ret, first_frame = first_frame_cap.read()
+    first_frame_cap.release()
+
+    scoreboard_kit_colors = []
+    if ret:
+        scoreboard_kit_colors = extract_scoreboard_kit_colors(first_frame)
+
     color_data = get_team_color_data(unique_players)
     team_cluster_map = resolve_team_cluster_map(
-        team_names,
-        scoreboard_kit_colors,
-        color_data,
-    )
-    selected_team = selected_display_to_internal(
-        requested_team_name,
-        team_names,
-        team_cluster_map,
+        team_names, scoreboard_kit_colors, color_data
     )
 
+    # ------------------------------------------------------------------
+    # 3b. Override mapping if user specified jersey color hint
+    # ------------------------------------------------------------------
+    if jersey_color_hint and jersey_color_hint != "Auto-detect" and len(team_names) >= 2:
+        requested_name = resolve_requested_team(team_query, team_names)
+        if requested_name:
+            ordered_names = [requested_name, [n for n in team_names if n != requested_name][0]]
+        else:
+            ordered_names = team_names
+        team_cluster_map = override_team_cluster_by_color_hint(
+            jersey_color_hint, ordered_names, team_cluster_map, color_data
+        )
+
+    # ------------------------------------------------------------------
+    # 4. Resolve user's requested team
+    # ------------------------------------------------------------------
+    requested_team_name = resolve_requested_team(team_query, team_names)
+    selected_team = selected_display_to_internal(
+        requested_team_name, team_names, team_cluster_map
+    )
+
+    if not selected_team:
+        selected_team = "Team 1"
+
+    # ------------------------------------------------------------------
+    # 5. Find best visual candidate frame
+    # ------------------------------------------------------------------
     best_candidate = find_best_visual_candidate(candidates, selected_team)
 
     if best_candidate is None:
-        return None, None, [], "Could not find a readable frame in the video."
+        empty_msg = "**⚠️ Could not find a readable frame.** Try a different clip."
+        return None, None, [], empty_msg, ""
 
     frame = best_candidate["frame"]
     frame_index = best_candidate["frame_index"]
     players = best_candidate["players"]
-    selected_players = best_candidate["selected_players"]
+    selected_players = best_candidate.get("selected_players", [])
+
+    # ------------------------------------------------------------------
+    # 6. Formation analysis
+    # ------------------------------------------------------------------
     formation_players = choose_formation_players(unique_players, selected_team)
     tracked_selected_players = [
-        player for player in unique_players if player["team"] == selected_team
+        player for player in unique_players if player.get("team") == selected_team
     ]
+    formation_result = estimate_formation(formation_players)
+
+    # ------------------------------------------------------------------
+    # 7. Build display map
+    # ------------------------------------------------------------------
     display_map = build_team_display_map(
-        team_names,
-        color_data,
-        team_cluster_map,
-        scoreboard_kit_colors,
+        team_names, color_data, team_cluster_map, scoreboard_kit_colors
     )
     selected_team_label = display_map.get(selected_team, selected_team)
-    formation_result = estimate_formation(formation_players)
+
+    # ------------------------------------------------------------------
+    # 8. Timestamp
+    # ------------------------------------------------------------------
+    timestamp = frame_index / fps if fps > 0 else 0.0
+
+    # ------------------------------------------------------------------
+    # 9. Draw visuals
+    # ------------------------------------------------------------------
+    annotated_frame = draw_boxes(frame, players, selected_team, display_map)
+    pitch_map = create_pitch_map(formation_players, selected_team, display_map)
+
+    # ------------------------------------------------------------------
+    # 10. Build coordinate table
+    # ------------------------------------------------------------------
+    coordinate_table = make_coordinate_table(formation_players, display_map)
+
+    # ------------------------------------------------------------------
+    # 11. Build user-friendly formation summary (Markdown)
+    # ------------------------------------------------------------------
+    confidence_val = formation_result.get("confidence", 0)
+    confidence_pct = int(confidence_val * 100)
+
+          # Confidence bar
+    filled = confidence_pct // 10
+    empty_blocks = 10 - filled
+    bar = "█" * filled + "░" * empty_blocks
+
+    # Confidence label
+    if confidence_val >= 0.85:
+        conf_label = "High"
+        conf_emoji = "✅"
+    elif confidence_val >= 0.65:
+        conf_label = "Medium"
+        conf_emoji = "●"
+    else:
+        conf_label = "Low"
+        conf_emoji = "⚠️"
+
+    line_counts = formation_result.get("line_counts", [])
+    raw_line_counts = formation_result.get("raw_line_counts", line_counts)
+
+    formation_summary = f"""
+## {selected_team_label}
+
+### Estimated Formation: **{formation_result.get('formation', 'Unknown')}**
+
+{conf_emoji} **Confidence: {conf_label} ({confidence_pct}%)**
+
+{bar}
+
+---
+
+**Line Structure:** {' - '.join(str(x) for x in line_counts)}
+
+**Players Used:** {len(formation_players)} outfield players tracked across the clip
+
+---
+
+? **What does this mean?**
+
+The model detected {len(formation_players)} players for {selected_team_label} and grouped them into
+defensive, midfield, and attacking lines based on their average positions across multiple frames.
+The shape **{formation_result.get('formation', 'Unknown')}** (lines of {', '.join(str(x) for x in line_counts)} players)
+was the closest match from the template library.
+
+{"⚠️ *Note: Confidence is below 70%. The camera angle, missing players, or similar kit colors may have affected accuracy.*" if confidence_val < 0.7 else ""}
+"""
+
+    # ------------------------------------------------------------------
+    # 12. Build technical details (Markdown)
+    # ------------------------------------------------------------------
     scoreboard_color_summary = "not detected"
     if len(scoreboard_kit_colors) >= 2:
         scoreboard_color_summary = (
@@ -366,35 +438,51 @@ def analyze_video(
             f"{describe_lab_color(scoreboard_kit_colors[1])}"
         )
 
-    annotated_frame = draw_boxes(frame, players, selected_team, display_map)
-    pitch_map = create_pitch_map(formation_players, selected_team, display_map)
-    coordinate_table = make_coordinate_table(formation_players, display_map)
+    technical_output = f"""
+#### Video & Sampling
+| Metric | Value |
+|--------|-------|
+| Total frames | {frame_count} |
+| Frames sampled | {sampled_frame_count} |
+| Frame stride | {int(frame_stride)} |
+| Preview frame | #{frame_index} (~{timestamp:.1f}s) |
+| FPS | {fps:.1f} |
 
-    timestamp = 0
-    if fps:
-        timestamp = frame_index / fps
+#### Detection & Tracking
+| Metric | Value |
+|--------|-------|
+| Players in preview frame | {len(players)} |
+| {selected_team_label} in preview frame | {len(selected_players)} |
+| Total {selected_team_label} track segments | {len(tracked_selected_players)} |
+| Players used for formation | {len(formation_players)} |
+| Min observations threshold | {MIN_TRACK_OBSERVATIONS} |
 
-    summary = (
-        f"Sampled {sampled_frame_count} frames and selected frame {frame_index} "
-        f"at about {timestamp:.1f} seconds for the visual preview.\n"
-        f"Speed setting: processed every {int(frame_stride)} frame(s).\n"
-        f"Detected {len(players)} total players in the selected frame.\n"
-        f"{selected_team_label} contains {len(selected_players)} detected players in that frame.\n\n"
-        f"Requested team: {team_query or 'not provided'}.\n"
-        f"Team names source: {matchup_source}.\n"
-        f"Scoreboard kit colors read left-to-right: {scoreboard_color_summary}.\n"
-        f"Detected cluster labels: {display_map['Team 1']} / {display_map['Team 2']}.\n"
-        f"Tracking produced {len(tracked_selected_players)} {selected_team_label} track segments across the clip.\n"
-        f"Formation analysis used the top {len(formation_players)} tracked {selected_team_label} players.\n"
-        "The pitch map and table now show only those formation players, not every tracking fragment.\n"
-        f"Formation Guess: {formation_result['formation']}\n"
-        f"Confidence: {formation_result['confidence']}\n"
-        f"Projected Formation Lines: {formation_result['line_counts']}\n"
-        f"Tracked Player Line Counts: {formation_result['raw_line_counts']}\n\n"
-        f"Explanation: {formation_result['explanation']}\n\n"
-        "Player identity is based on YOLO tracking IDs. "
-        "Team separation uses jersey-color clustering with a third Official/Other group for referees or outliers. "
-        "If the teams have similar colors or the image is blurry, the grouping may be imperfect."
-    )
+#### Team Identification
+| Metric | Value |
+|--------|-------|
+| Requested team input | `{team_query or 'not provided'}` |
+| Resolved team | {selected_team_label} |
+| Internal cluster | {selected_team} |
+| Team names source | {matchup_source} |
+| Scoreboard kit colors | {scoreboard_color_summary} |
+| Cluster labels | {display_map.get('Team 1', 'N/A')} / {display_map.get('Team 2', 'N/A')} |
 
-    return annotated_frame, pitch_map, coordinate_table, summary
+#### Formation Internals
+| Metric | Value |
+|--------|-------|
+| Formation guess | {formation_result.get('formation', 'Unknown')} |
+| Raw confidence score | {confidence_val:.4f} |
+| Projected line counts | {line_counts} |
+| Raw line counts | {raw_line_counts} |
+
+#### How It Works
+1. **YOLO Detection** — YOLOv8 detects all people in each sampled frame
+2. **Multi-frame Tracking** — Players are tracked across frames using YOLO's built-in tracker
+3. **Kit Color Clustering** — K-Means (k=3) on jersey LAB colors separates Team 1, Team 2, and Officials
+4. **Scoreboard OCR** — Abbreviations and kit-color swatches from the broadcast graphic help label clusters
+5. **Position Averaging** — Each player's position is averaged across all frames they appear in
+6. **Line Grouping** — Players are grouped into depth lines (defense, midfield, attack) by Y-coordinate clustering
+7. **Template Matching** — Line counts are compared to formation templates (4-3-3, 4-4-2, etc.) to find the best fit
+"""
+
+    return annotated_frame, pitch_map, coordinate_table, formation_summary, technical_output

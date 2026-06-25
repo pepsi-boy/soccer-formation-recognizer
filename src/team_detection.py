@@ -5,6 +5,7 @@ from sklearn.cluster import KMeans
 from .utils import (
     bgr_to_lab_color,
     describe_lab_color,
+    describe_team_color_comparative,
     get_video_path,
     normalize_text,
     read_first_frame,
@@ -12,6 +13,9 @@ from .utils import (
     extract_scoreboard_text,
     extract_team_names_from_text,
 )
+
+from .config import EXPECTED_OUTFIELD_PLAYERS, MIN_TRACK_OBSERVATIONS
+
 
 def dominant_lab_color(crop):
     if crop.size == 0:
@@ -42,10 +46,10 @@ def dominant_lab_color(crop):
 
     return bgr_to_lab_color(dominant_bgr)
 
+
 def extract_scoreboard_kit_colors(frame):
     height, width = frame.shape[:2]
 
-    # These zones target the left and right team-color panels in common TV scorebugs.
     zones = [
         (0.03, 0.13, 0.07, 0.16),
         (0.19, 0.32, 0.07, 0.16),
@@ -64,6 +68,7 @@ def extract_scoreboard_kit_colors(frame):
         return []
 
     return kit_colors
+
 
 def get_team_color_data(players):
     color_data = {}
@@ -87,6 +92,7 @@ def get_team_color_data(players):
         }
 
     return color_data
+
 
 def resolve_team_cluster_map(team_names, scoreboard_kit_colors, team_color_data):
     if len(team_names) < 2:
@@ -116,6 +122,7 @@ def resolve_team_cluster_map(team_names, scoreboard_kit_colors, team_color_data)
         team_names[1]: "Team 2",
     }
 
+
 def build_team_display_map(team_names, color_data, team_cluster_map=None, scoreboard_kit_colors=None):
     team_cluster_map = team_cluster_map or {}
     scoreboard_kit_colors = scoreboard_kit_colors or []
@@ -125,27 +132,32 @@ def build_team_display_map(team_names, color_data, team_cluster_map=None, scoreb
         cluster: team_name
         for team_name, cluster in team_cluster_map.items()
     }
-    scoreboard_label_by_team = {
-        team_name: describe_lab_color(scoreboard_kit_colors[index])
-        for index, team_name in enumerate(team_names[:len(scoreboard_kit_colors)])
+
+    # Get LAB colors for both teams
+    team1_lab = color_data.get("Team 1", {}).get("lab")
+    team2_lab = color_data.get("Team 2", {}).get("lab")
+
+    # Use comparative labeling (handles grass contamination better)
+    label1, label2 = describe_team_color_comparative(team1_lab, team2_lab)
+
+    color_labels = {
+        "Team 1": label1,
+        "Team 2": label2,
     }
 
-    for index, internal_team in enumerate(["Team 1", "Team 2"]):
+    for internal_team in ["Team 1", "Team 2"]:
         team_name = team_name_by_cluster.get(internal_team)
-        color_label = color_data.get(internal_team, {}).get("label", "unknown kit")
-        if team_name in scoreboard_label_by_team:
-            color_label = scoreboard_label_by_team[team_name]
+        color_label = color_labels[internal_team]
 
-        if internal_team in team_name_by_cluster:
-            display_map[internal_team] = f"{team_name_by_cluster[internal_team]} ({color_label})"
-        elif index < len(team_names):
-            display_map[internal_team] = f"{team_names[index]}? ({internal_team}, {color_label})"
+        if team_name:
+            display_map[internal_team] = f"{team_name} ({color_label})"
         else:
             display_map[internal_team] = f"{internal_team} ({color_label})"
 
     display_map["Official/Other"] = "Official/Other"
 
     return display_map
+
 
 def selected_display_to_internal(selected_team, team_names, team_cluster_map=None):
     if selected_team in ["Team 1", "Team 2"]:
@@ -156,7 +168,6 @@ def selected_display_to_internal(selected_team, team_names, team_cluster_map=Non
     if selected_team in team_cluster_map:
         return team_cluster_map[selected_team]
 
-    # Fallback when cluster mapping hasn't been established yet
     if team_names:
         if selected_team == team_names[0]:
             return "Team 1"
@@ -166,15 +177,19 @@ def selected_display_to_internal(selected_team, team_names, team_cluster_map=Non
 
     return None
 
+
 def update_team_status(video_input):
     video_path = get_video_path(video_input)
     team_names, source = resolve_matchup(video_path)
 
     if len(team_names) >= 2:
-        status = f"Detected matchup: {team_names[0]} vs {team_names[1]} ({source})"
-        return status
+        return f"{team_names[0]} and {team_names[1]}"
 
-    return "Could not detect both team names from the scoreboard yet."
+    if len(team_names) == 1:
+        return f"{team_names[0]} (other team not detected)"
+
+    return "Could not detect teams from the scoreboard."
+
 
 def get_jersey_color(frame, bbox):
     x1, y1, x2, y2 = map(int, bbox)
@@ -208,6 +223,66 @@ def get_jersey_color(frame, bbox):
     average_color = np.mean(lab_pixels.reshape(-1, 3), axis=0)
 
     return average_color
+
+def override_team_cluster_by_color_hint(color_hint, team_names, team_cluster_map, color_data):
+    """
+    If user specified a jersey color hint for their team (team_names[0] or the queried team),
+    override the cluster mapping to match.
+    
+    color_hint: one of "Lighter/White", "Darker/Black", "Red", "Blue", "Yellow", "Green", "Orange"
+    Returns updated team_cluster_map.
+    """
+    if not color_hint or color_hint == "Auto-detect" or len(team_names) < 2:
+        return team_cluster_map
+
+    team1_lab = color_data.get("Team 1", {}).get("lab")
+    team2_lab = color_data.get("Team 2", {}).get("lab")
+
+    if team1_lab is None or team2_lab is None:
+        return team_cluster_map
+
+    l1, a1, b1 = float(team1_lab[0]), float(team1_lab[1]), float(team1_lab[2])
+    l2, a2, b2 = float(team2_lab[0]), float(team2_lab[1]), float(team2_lab[2])
+
+    # Score each cluster for how well it matches the hint
+    def score_cluster(l, a, b, hint):
+        a_shift = a - 128
+        b_shift = b - 128
+        if hint in ("Lighter/White",):
+            return l  # higher L = better match
+        elif hint in ("Darker/Black",):
+            return 255 - l  # lower L = better match
+        elif hint == "Red":
+            return a_shift  # higher a = more red
+        elif hint == "Blue":
+            return -b_shift  # lower b = more blue
+        elif hint == "Yellow":
+            return b_shift  # higher b = more yellow
+        elif hint == "Green":
+            return -a_shift  # lower a = more green
+        elif hint == "Orange":
+            return a_shift + b_shift  # high a and high b
+        return 0
+
+    score1 = score_cluster(l1, a1, b1, color_hint)
+    score2 = score_cluster(l2, a2, b2, color_hint)
+
+    # The cluster with the higher score matches the user's team
+    # team_names[0] is assumed to be the user's selected team
+    # (or we can pass in the specific team — for now, use first team in team_names)
+    if score1 >= score2:
+        # Team 1 cluster matches the hint → first team name maps to Team 1
+        return {
+            team_names[0]: "Team 1",
+            team_names[1]: "Team 2",
+        }
+    else:
+        # Team 2 cluster matches the hint → first team name maps to Team 2
+        return {
+            team_names[0]: "Team 2",
+            team_names[1]: "Team 1",
+        }
+
 
 def assign_teams_by_color(players):
     if len(players) < 2:
