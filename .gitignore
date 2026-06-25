@@ -21,3 +21,8 @@ examples/*.mkv
 
 .gradio/
 runs/
+debug_*.png
+*.zip
+__pycache__/
+.venv/
+*.pyc
